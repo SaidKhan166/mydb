@@ -8,9 +8,6 @@ class Withdrawal {
     private $conn;
     private $withdrawals_table = 'withdrawals';
     private $wallets_table = 'wallets';
-    private $deposits_table = 'deposits';
-    private $tron_api_url = TRON_API_URL;
-    private $tron_api_key = TRON_API_KEY;
     
     public function __construct($db) {
         $this->conn = $db;
@@ -74,7 +71,7 @@ class Withdrawal {
                 $withdrawal_id = $stmt->insert_id;
                 
                 // Log transaction
-                $this->logTransaction($user_id, 'withdrawal_request', 'Withdrawal request created', null, 
+                $this->logTransaction($user_id, 'withdrawal', 'Withdrawal request created', null, 
                     json_encode(['withdrawal_id' => $withdrawal_id, 'amount' => $amount]));
                 
                 $this->conn->commit();
@@ -115,6 +112,28 @@ class Withdrawal {
     }
     
     /**
+     * Get withdrawal details
+     */
+    public function getWithdrawal($withdrawal_id, $user_id = null) {
+        $query = "SELECT * FROM " . $this->withdrawals_table . " WHERE id = ?";
+        
+        if ($user_id) {
+            $query .= " AND user_id = ?";
+        }
+        
+        $stmt = $this->conn->prepare($query);
+        
+        if ($user_id) {
+            $stmt->bind_param('ii', $withdrawal_id, $user_id);
+        } else {
+            $stmt->bind_param('i', $withdrawal_id);
+        }
+        
+        $stmt->execute();
+        return $stmt->get_result()->fetch_assoc();
+    }
+    
+    /**
      * Get pending withdrawals (for admin)
      */
     public function getPendingWithdrawals($limit = 50, $offset = 0) {
@@ -136,22 +155,28 @@ class Withdrawal {
      * Approve withdrawal (admin)
      */
     public function approveWithdrawal($withdrawal_id, $admin_id) {
-        $query = "UPDATE " . $this->withdrawals_table . " 
-                  SET status = 'processing', 
-                      approved_by = ?, 
-                      approved_at = NOW()
-                  WHERE id = ? AND status = 'pending'";
+        $this->conn->begin_transaction();
         
-        $stmt = $this->conn->prepare($query);
-        $stmt->bind_param('ii', $admin_id, $withdrawal_id);
-        
-        if ($stmt->execute() && $stmt->affected_rows > 0) {
-            $this->logTransaction($admin_id, 'withdrawal_approved', 'Withdrawal approved', null, 
-                json_encode(['withdrawal_id' => $withdrawal_id]));
+        try {
+            $query = "UPDATE " . $this->withdrawals_table . " 
+                      SET status = 'processing', 
+                          approved_by = ?, 
+                          approved_at = NOW()
+                      WHERE id = ? AND status = 'pending'";
             
-            return ['success' => true, 'message' => 'Withdrawal approved'];
-        } else {
-            return ['success' => false, 'message' => 'Failed to approve withdrawal'];
+            $stmt = $this->conn->prepare($query);
+            $stmt->bind_param('ii', $admin_id, $withdrawal_id);
+            $stmt->execute();
+            
+            if ($stmt->affected_rows > 0) {
+                $this->conn->commit();
+                return ['success' => true, 'message' => 'Withdrawal approved'];
+            } else {
+                throw new Exception('Failed to approve withdrawal');
+            }
+        } catch (Exception $e) {
+            $this->conn->rollback();
+            return ['success' => false, 'message' => 'Error: ' . $e->getMessage()];
         }
     }
     
@@ -176,7 +201,7 @@ class Withdrawal {
             $total_amount = $withdrawal['amount'] + $withdrawal['fee'];
             
             // Unlock funds
-            $query = "UPDATE " . $this->wallets_table . " 
+            $query = "UPDATE wallets 
                       SET balance = balance + ?, 
                           balance_locked = balance_locked - ?
                       WHERE id = ?";
@@ -195,118 +220,14 @@ class Withdrawal {
             
             $stmt = $this->conn->prepare($query);
             $stmt->bind_param('ssii', $status, $reason, $admin_id, $withdrawal_id);
+            $stmt->execute();
             
-            if ($stmt->execute()) {
-                $this->conn->commit();
-                return ['success' => true, 'message' => 'Withdrawal rejected'];
-            } else {
-                throw new Exception('Failed to update withdrawal');
-            }
+            $this->conn->commit();
+            return ['success' => true, 'message' => 'Withdrawal rejected'];
         } catch (Exception $e) {
             $this->conn->rollback();
             return ['success' => false, 'message' => 'Error: ' . $e->getMessage()];
         }
-    }
-    
-    /**
-     * Process withdrawal (send to blockchain)
-     */
-    public function processWithdrawal($withdrawal_id) {
-        // Get withdrawal details
-        $query = "SELECT w.*, u.tron_wallet_address, u.id as user_id
-                  FROM " . $this->withdrawals_table . " w
-                  JOIN users u ON w.user_id = u.id
-                  WHERE w.id = ? AND w.status = 'processing'";
-        
-        $stmt = $this->conn->prepare($query);
-        $stmt->bind_param('i', $withdrawal_id);
-        $stmt->execute();
-        $withdrawal = $stmt->get_result()->fetch_assoc();
-        
-        if (!$withdrawal) {
-            return ['success' => false, 'message' => 'Withdrawal not found or not in processing status'];
-        }
-        
-        // Send transaction to TRON blockchain
-        $tx_result = $this->sendTronTransaction(
-            $withdrawal['tron_wallet_address'],
-            $withdrawal['withdrawal_address'],
-            $withdrawal['amount']
-        );
-        
-        if (!$tx_result['success']) {
-            // Increment retry count
-            $query = "UPDATE " . $this->withdrawals_table . " 
-                      SET retry_count = retry_count + 1,
-                          error_message = ?
-                      WHERE id = ? AND retry_count < max_retries";
-            
-            $stmt = $this->conn->prepare($query);
-            $stmt->bind_param('si', $tx_result['message'], $withdrawal_id);
-            $stmt->execute();
-            
-            if ($stmt->affected_rows === 0) {
-                // Max retries exceeded, mark as failed
-                $status = 'failed';
-                $query = "UPDATE " . $this->withdrawals_table . " SET status = ? WHERE id = ?";
-                $stmt = $this->conn->prepare($query);
-                $stmt->bind_param('si', $status, $withdrawal_id);
-                $stmt->execute();
-            }
-            
-            return $tx_result;
-        }
-        
-        // Update withdrawal with transaction hash
-        $status = 'completed';
-        $tx_hash = $tx_result['transaction_hash'];
-        
-        $query = "UPDATE " . $this->withdrawals_table . " 
-                  SET status = ?, 
-                      transaction_hash = ?,
-                      processed_at = NOW(),
-                      completed_at = NOW()
-                  WHERE id = ?";
-        
-        $stmt = $this->conn->prepare($query);
-        $stmt->bind_param('ssi', $status, $tx_hash, $withdrawal_id);
-        
-        if ($stmt->execute()) {
-            // Log transaction
-            $this->logTransaction($withdrawal['user_id'], 'withdrawal_completed', 'Withdrawal completed', null, 
-                json_encode(['withdrawal_id' => $withdrawal_id, 'tx_hash' => $tx_hash]));
-            
-            return [
-                'success' => true,
-                'message' => 'Withdrawal completed',
-                'transaction_hash' => $tx_hash
-            ];
-        } else {
-            return ['success' => false, 'message' => 'Failed to update withdrawal status'];
-        }
-    }
-    
-    /**
-     * Send TRON transaction (simplified implementation)
-     */
-    private function sendTronTransaction($from_address, $to_address, $amount) {
-        // In production, implement actual TRON transaction signing and broadcasting
-        // This is a placeholder for security reasons
-        
-        // Generate mock transaction hash
-        $tx_hash = '0x' . bin2hex(random_bytes(32));
-        
-        // TODO: Implement actual TRON transaction:
-        // 1. Create transaction object
-        // 2. Sign with private key
-        // 3. Broadcast to TRON network
-        // 4. Wait for confirmation
-        
-        return [
-            'success' => true,
-            'transaction_hash' => $tx_hash,
-            'message' => 'Transaction sent (mock)'
-        ];
     }
     
     /**
@@ -331,7 +252,7 @@ class Withdrawal {
             $total_amount = $withdrawal['amount'] + $withdrawal['fee'];
             
             // Unlock funds
-            $query = "UPDATE " . $this->wallets_table . " 
+            $query = "UPDATE wallets 
                       SET balance = balance + ?, 
                           balance_locked = balance_locked - ?
                       WHERE id = ?";
@@ -341,20 +262,35 @@ class Withdrawal {
             
             // Cancel withdrawal
             $status = 'cancelled';
-            $query = "UPDATE " . $this->withdrawals_table . " SET status = ? WHERE id = ?";
+            $query = "UPDATE " . $this->withdrawals_table . " SET status = ?, updated_at = NOW() WHERE id = ?";
             $stmt = $this->conn->prepare($query);
             $stmt->bind_param('si', $status, $withdrawal_id);
+            $stmt->execute();
             
-            if ($stmt->execute()) {
-                $this->conn->commit();
-                return ['success' => true, 'message' => 'Withdrawal cancelled'];
-            } else {
-                throw new Exception('Failed to cancel withdrawal');
-            }
+            $this->conn->commit();
+            return ['success' => true, 'message' => 'Withdrawal cancelled'];
         } catch (Exception $e) {
             $this->conn->rollback();
             return ['success' => false, 'message' => 'Error: ' . $e->getMessage()];
         }
+    }
+    
+    /**
+     * Get withdrawal statistics
+     */
+    public function getStats($user_id) {
+        $query = "SELECT 
+                    COUNT(*) as total_withdrawals,
+                    SUM(CASE WHEN status = 'completed' THEN amount ELSE 0 END) as completed_amount,
+                    SUM(CASE WHEN status = 'pending' THEN amount ELSE 0 END) as pending_amount,
+                    SUM(CASE WHEN status = 'processing' THEN amount ELSE 0 END) as processing_amount
+                  FROM " . $this->withdrawals_table . " WHERE user_id = ?";
+        
+        $stmt = $this->conn->prepare($query);
+        $stmt->bind_param('i', $user_id);
+        $stmt->execute();
+        
+        return $stmt->get_result()->fetch_assoc();
     }
     
     /**
